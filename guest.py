@@ -25,6 +25,7 @@ OP_JZ = 6     # if r[a] == 0: pc = b
 OP_HALT = 7   # stop
 
 _BRANCH_OPS = {OP_JMP, OP_JZ, OP_HALT}
+_KNOWN_OPS = {OP_ADD, OP_LOAD, OP_STORE, OP_SUB, OP_JMP, OP_JZ, OP_HALT}
 
 CODE_END = 0x40  # first data address; code lives in [0, CODE_END)
 
@@ -54,6 +55,10 @@ class Guest:
         addr = pc
         while addr + 3 <= len(self.mem):
             op = self.mem[addr]
+            if op not in _KNOWN_OPS:
+                raise ValueError(
+                    f"undecodable opcode 0x{op:02X} at guest address "
+                    f"0x{addr:02X}")
             insts.append((op, self.mem[addr + 1], self.mem[addr + 2]))
             addr += 3
             if op in _BRANCH_OPS:
