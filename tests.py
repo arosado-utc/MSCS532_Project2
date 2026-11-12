@@ -1,5 +1,5 @@
 """
-MSCS 532 - Project (Phase 1)
+MSCS 532 - Project (Phases 1 + 2)
 EmuCache test suite.
 
 Run with:  python3 tests.py
@@ -8,15 +8,21 @@ Covers the hash table, the LRU cache, the SMC watcher, the block
 decoder, and full end-to-end runs of the demo guest programs. The
 end-to-end tests are checked against a naive single-step
 interpreter, so any divergence between the cached path and the
-reference path fails the suite.
+reference path fails the suite. Phase 2 adds the parameterized
+workloads from workloads.py and the benchmark harness from
+benchmark.py: every workload is checked against the reference
+interpreter, and the expected block counts, eviction counts, and
+invalidation counts are asserted by hand.
 """
 
+from benchmark import run_case
 from cache import HashTable, LRUCache
 from emulator import Emulator
 from guest import (Guest, OP_ADD, OP_HALT, OP_JMP, OP_JZ, OP_LOAD,
                    OP_STORE, OP_SUB)
 from main import program_counter, program_self_patching
 from smc import PageWatcher
+from workloads import counter, hub_game, multi_phase_game, patch_game
 
 
 # reference interpreter: single-step, no blocks, no cache
@@ -241,6 +247,126 @@ def test_non_halting_guest_hits_step_limit():
         assert False, "expected RuntimeError"
     except RuntimeError:
         pass
+
+
+# Phase 2: workloads
+def test_workloads_match_reference():
+    """Every workload must produce the same register file as the
+    naive interpreter, and the expected final score."""
+    cases = [
+        (lambda: counter(100), 100),
+        (lambda: multi_phase_game(50), 21 * 50),
+        (lambda: hub_game(30), 7 * 30),
+        (lambda: patch_game(3, 50), 17 * 50),
+    ]
+    for builder, score in cases:
+        expected = naive_run(builder())
+        actual = Emulator(builder(), cache_capacity=8).run()
+        assert actual == expected
+        assert actual[0] == score
+
+
+def test_counter_working_set():
+    """The counter has four block starts (the loopback targets
+    0x06, inside the first block); C = 8 covers them all."""
+    emu = Emulator(counter(255), cache_capacity=8)
+    emu.run()
+    assert emu.stats["misses"] == 4
+    assert emu.stats["evictions"] == 0
+
+
+def test_counter_capacity_one():
+    emu = Emulator(counter(100), cache_capacity=1)
+    emu.run()
+    assert emu.stats["hits"] == 0
+    assert emu.stats["misses"] == 200
+
+
+def test_hub_working_set_and_thrash():
+    """The hub's seven blocks stay live until the countdowns
+    expire. A C = 8 cache holds them all (seven misses, no
+    evictions); a C = 3 cache cannot hold the six-block round
+    and re-misses on almost every fetch."""
+    big = Emulator(hub_game(30), cache_capacity=8)
+    big.run()
+    assert big.stats["misses"] == 7
+    assert big.stats["evictions"] == 0
+    small = Emulator(hub_game(30), cache_capacity=3)
+    small.run()
+    assert small.stats["misses"] > 100
+    assert small.stats["evictions"] > 0
+
+
+def test_multi_phase_no_remisses():
+    """The phases are sequential: retired blocks are never
+    re-fetched, so misses stay at the working-set size (10)
+    even when the cache cannot hold them - evictions happen,
+    re-misses do not."""
+    emu = Emulator(multi_phase_game(50), cache_capacity=2)
+    emu.run()
+    assert emu.stats["misses"] == 10
+    assert emu.stats["evictions"] == 8
+
+
+def test_patch_invalidations_follow_the_page():
+    """The SMC write lands on page 0; the check and patch
+    blocks sit on page 1 and survive their own writes. The
+    first patch invalidates three cached blocks (prologue,
+    body, loopback), later patches invalidate two (the
+    prologue is gone), so four cycles give 3 + 2 + 2 = 7."""
+    emu = Emulator(patch_game(4, 20), cache_capacity=8)
+    emu.run()
+    assert emu.stats["invalidations"] == 7
+    assert emu.stats["misses"] == 12
+    assert emu.stats["evictions"] == 0
+
+
+def test_patch_single_cycle_no_smc():
+    """One cycle means no patch routine run and no SMC write."""
+    emu = Emulator(patch_game(1, 100), cache_capacity=8)
+    emu.run()
+    assert emu.stats["invalidations"] == 0
+    assert emu.stats["misses"] == 5
+
+
+def test_workload_builder_validation():
+    for bad in (dict(reps=0), dict(reps=256)):
+        try:
+            counter(**bad)
+            assert False, "expected ValueError"
+        except ValueError:
+            pass
+    for bad in (0, 256):
+        try:
+            hub_game(bad)
+            assert False, "expected ValueError"
+        except ValueError:
+            pass
+    try:
+        patch_game(cycles=0, reps=50)
+        assert False, "expected ValueError"
+    except ValueError:
+        pass
+
+
+def test_hit_rate_monotone_in_capacity():
+    """A larger LRU cache never misses more than a smaller one
+    on the same access sequence, so the hit rate must be
+    non-decreasing in the capacity."""
+    for builder in (lambda: counter(100), lambda: multi_phase_game(50),
+                    lambda: hub_game(30), lambda: patch_game(3, 50)):
+        rates = [run_case(builder, c)["hit_rate_pct"]
+                 for c in (1, 2, 3, 4, 5, 6, 8, 10, 16)]
+        for lo, hi in zip(rates, rates[1:]):
+            assert hi >= lo, (builder, rates)
+
+
+def test_run_case_row_is_consistent():
+    row = run_case(lambda: patch_game(3, 50), 8)
+    assert row["hits"] + row["misses"] == row["fetches"]
+    assert row["hit_rate_pct"] == round(
+        100.0 * row["hits"] / row["fetches"], 2)
+    assert 0.0 <= row["hit_rate_pct"] <= 100.0
 def main():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
