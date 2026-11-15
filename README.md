@@ -15,6 +15,8 @@ structures that make that caching work.
 | `smc.py`     | `PageWatcher` - page -> set of block IDs         | O(1) lookup |
 | `guest.py`   | toy guest machine + basic block decoder          | - |
 | `emulator.py`| the recompiler core tying the pieces together    | - |
+| `workloads.py` | parameterized guest workloads (Phase 2)         | - |
+| `benchmark.py` | cache-size and input-mix sweeps (Phase 2)      | - |
 
 Why these choices:
 
@@ -63,17 +65,57 @@ Run it:
 python3 main.py
 ```
 
+## Phase 2: proof of concept
+
+Phase 2 extends the demo to parameterized workloads and reports
+the cache statistics as a function of cache size and input mix.
+`workloads.py` builds four families on the same machine:
+
+| Workload        | Access pattern            | Working set | Notes |
+| --------------- | ------------------------- | ----------- | ----- |
+| `counter(n)`    | one hot loop              | 4 blocks    | baseline; the loopback targets 0x06, inside the first block |
+| `multi_phase_game(n)` | three sequential phases | 10 blocks | phases are visited once and retired |
+| `hub_game(n)`   | round-robin over three routines | 7 blocks | every block stays live until the countdowns expire |
+| `patch_game(cycles, n)` | one loop that rewrites its own increment register | 5 blocks + retranslations | the working set is created by SMC invalidation, not by code layout |
+
+`benchmark.py` runs three sweeps and writes CSVs to `results/`
+and plots to `plots/`:
+
+- **Capacity sweep** - hit rate vs cache capacity (1..16) for
+  each workload. The counter saturates at C = 2; the hub - a
+  six-block round-robin - stays under 1% hit rate until C = 5
+  and jumps to 96% at C = 6, because a cycle of six distinct
+  blocks cannot be held in a smaller LRU; the multi-phase game
+  saturates at C = 2 with no re-misses, because its retired
+  blocks are never re-fetched.
+- **Size sweep** - wall time vs workload size at C = 8. All
+  three families scale linearly in the fetch count.
+- **Patch sweep** - hit and invalidation rates vs patch period
+  at a fixed 300 total iterations. Shorter patch periods cost
+  ~3.2% of the hit rate and raise the invalidation rate from
+  5 to 38 per 1000 fetches.
+
+Run it:
+
+```bash
+python3 benchmark.py
+```
+
 ## Tests
 
 ```bash
 python3 tests.py
 ```
 
-19 tests cover the hash table (probing, tombstones, rehashing,
+29 tests cover the hash table (probing, tombstones, rehashing,
 key spread), the LRU cache (eviction order, refresh, removal),
 the page watcher (registration, spanning pages, unwatched
-pages), the decoder, and full end-to-end runs checked against a
-naive single-step reference interpreter.
+pages), the decoder, end-to-end runs of the Phase 1 programs
+checked against a naive single-step reference interpreter, and
+the Phase 2 workloads: reference-interpreter agreement, the
+hand-counted block/eviction/invalidation totals, builder
+validation, and the monotonicity of the hit rate in the cache
+capacity.
 
 ## References
 
